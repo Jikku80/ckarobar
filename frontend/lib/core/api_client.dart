@@ -1,9 +1,10 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:io' show SocketException;
 
 import 'package:cookie_jar/cookie_jar.dart';
 import 'package:dio/dio.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:path_provider/path_provider.dart';
 
 import 'config.dart';
@@ -34,7 +35,7 @@ class ApiException implements Exception {
 ///    flight, so concurrent 401s don't all hammer /auth/refresh at once.
 class ApiClient {
   late final Dio dio;
-  late final PersistCookieJar _cookieJar;
+  PersistCookieJar? _cookieJar;
   bool _cookieJarReady = false;
 
   bool _isRefreshing = false;
@@ -49,8 +50,27 @@ class ApiClient {
       BaseOptions(
         baseUrl: AppConfig.apiUrl,
         headers: {'Content-Type': 'application/json'},
-        connectTimeout: const Duration(seconds: 20),
-        receiveTimeout: const Duration(seconds: 30),
+        // Kept short and equal-ish on purpose: on native platforms a slow
+        // backend legitimately needs time, but on Flutter Web a bad/
+        // unreachable AppConfig.baseUrl (e.g. still pointing at
+        // localhost:4000 with nothing listening there) should fail fast
+        // and visibly instead of looking like the app is frozen for 20s.
+        connectTimeout: const Duration(seconds: 12),
+        receiveTimeout: const Duration(seconds: 20),
+        // On Flutter Web, Dio's BrowserHttpClientAdapter only attaches and
+        // stores cookies on a *cross-site* request (our case: the app's
+        // origin, e.g. http://localhost:PORT from `flutter run -d chrome`,
+        // is a different origin than the https://app.clinickarobar.com
+        // backend) if the underlying XHR/fetch call has credentials mode
+        // "include". This is the exact web equivalent of the Next.js web
+        // app's `axios.create({ withCredentials: true })` in lib/api.ts —
+        // without it, the browser silently drops the Set-Cookie response
+        // headers from /auth/login and never attaches them on the next
+        // request, so the session behaves as if login never happened even
+        // though the POST itself succeeded. This flag is a no-op (and
+        // harmless) on native platforms, where CookieManager below is what
+        // actually persists the session instead.
+        extra: {'withCredentials': true},
         // We handle non-2xx ourselves via ApiException instead of Dio's
         // default throw-on-any-non-2xx, so callers get consistent errors.
         validateStatus: (status) => status != null && status < 500,
@@ -67,18 +87,41 @@ class ApiClient {
 
   Future<void> init() async {
     if (_cookieJarReady) return;
+    // path_provider (file-system paths) and dio_cookie_manager's
+    // FileStorage-backed PersistCookieJar both depend on dart:io File/
+    // Directory APIs that don't exist in a browser sandbox. On Flutter
+    // Web, getApplicationDocumentsDirectory() throws (there is no
+    // filesystem to hand back a path to), which previously made this
+    // `await init()` — called at the top of every single request,
+    // including login — throw before the HTTP call was even made. That's
+    // the actual cause of requests that looked like they were "timing
+    // out" when running via `flutter run -d chrome`. The browser already
+    // has its own native cookie jar and sends/receives cookies for us
+    // automatically once `withCredentials: true` is set above, so on web
+    // we skip this entirely instead of trying to persist cookies to a
+    // file that can't exist.
+    if (kIsWeb) {
+      _cookieJarReady = true;
+      return;
+    }
     final dir = await getApplicationDocumentsDirectory();
-    _cookieJar = PersistCookieJar(
+    final jar = PersistCookieJar(
       ignoreExpires: false,
       storage: FileStorage('${dir.path}/.cookies/'),
     );
-    dio.interceptors.add(CookieManager(_cookieJar));
+    _cookieJar = jar;
+    dio.interceptors.add(CookieManager(jar));
     _cookieJarReady = true;
   }
 
   Future<void> clearCookies() async {
     await init();
-    await _cookieJar.deleteAll();
+    // On web there's no app-managed cookie jar to clear (see init() above)
+    // — the browser owns those cookies. /auth/logout clearing the
+    // HttpOnly cookies server-side (via Set-Cookie with an expired date)
+    // is what actually signs the browser out; there's nothing more to do
+    // here.
+    await _cookieJar?.deleteAll();
   }
 
   bool _isAuthEndpoint(String path) {
@@ -131,8 +174,19 @@ class ApiClient {
       return response;
     } on DioException catch (e) {
       if (e.type == DioExceptionType.connectionError ||
+          e.type == DioExceptionType.connectionTimeout ||
+          e.type == DioExceptionType.receiveTimeout ||
+          e.type == DioExceptionType.sendTimeout ||
           e.error is SocketException) {
-        throw ApiException(message: 'Network error — check your connection.');
+        // Surface exactly what URL we tried — this is the single most
+        // useful thing for telling "wrong AppConfig.baseUrl" apart from
+        // "backend is actually down" apart from "CORS blocked it" (which
+        // Dio/the browser reports as a connectionError too, since a
+        // blocked preflight never yields a real HTTP response).
+        throw ApiException(
+          message: 'Could not reach ${AppConfig.baseUrl} — check the backend is running and '
+              'reachable, and (on web) that its CORS settings allow this app\'s origin.',
+        );
       }
       throw ApiException(
         statusCode: e.response?.statusCode,
